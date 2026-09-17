@@ -227,6 +227,10 @@ class StreamingParserEngine:
         self._recovered_tool_call = False
         self._pending_between_text = ""
         self._hold_active = False
+        # "name" while the recovered tool name is still being read,
+        # "body" once it validated and the block must prove it closes.
+        # Advanced only on the strict_tool_call_admission path.
+        self._hold_phase = "name"
         self._held_events: list[SemanticEvent] = []
         self._held_raw: list[str] = []
         self._held_name: list[str] = []
@@ -503,6 +507,18 @@ class StreamingParserEngine:
         return self._apply_transition(transition, value, token_count)
 
     def _emit_for_state(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
+        # Body of a recovered call still awaiting its close: keep both the
+        # raw text and the events it would have produced, so the block can
+        # be committed whole or released as content.  Unreachable unless
+        # strict admission advanced the hold into its body phase.
+        if self._hold_active and self._hold_phase == "body":
+            self._held_raw.append(text)
+            self._hold_active = False
+            try:
+                self._held_events.extend(self._emit_for_state(text, token_count))
+            finally:
+                self._hold_active = True
+            return []
         if self._hold_active and self.state == ParserState.TOOL_NAME:
             candidate = "".join(self._held_name) + text
             if not self._can_grow_into_declared_name(candidate):
@@ -608,6 +624,7 @@ class StreamingParserEngine:
         self._held_prior_state = prior_state
         self._held_prior_tool_index = prior_tool_index
         self._hold_active = True
+        self._hold_phase = "name"
         self._recovered_tool_call = True
         return []
 
@@ -617,15 +634,44 @@ class StreamingParserEngine:
         value: str,
         token_count: int = 0,
     ) -> list[SemanticEvent]:
-        """End the hold window at the name-completing transition."""
-        name = "".join(self._held_name)
-        allowed = self.allowed_tool_names
-        if allowed is not None and name in allowed:
-            events = self._held_events
+        """Advance the hold window, ending it once the call is proven."""
+        if not self.config.strict_tool_call_admission:
+            name = "".join(self._held_name)
+            allowed = self.allowed_tool_names
+            if allowed is not None and name in allowed:
+                events = self._held_events
+                self._clear_hold()
+                events.extend(self._run_transition(transition, value, token_count))
+                return events
+            return self._abort_hold("".join(self._held_raw) + value)
+
+        # Strict admission: a declared name is not on its own enough to
+        # commit a tool call that was recovered without its opening
+        # wrapper — ordinary prose quoting an invoke marker carries a
+        # real tool name too.  Such a block is only real if it actually
+        # closes, so the hold continues through the body until a
+        # TOOL_CALL_END arrives.  Prose never produces one, and
+        # ``finish`` releases the held text as content when none does.
+        if self._hold_phase == "name":
+            name = "".join(self._held_name)
+            allowed = self.allowed_tool_names
+            if allowed is None or name not in allowed:
+                return self._abort_hold("".join(self._held_raw) + value)
+            self._held_raw.append(value)
+            self._held_events.extend(
+                self._run_transition(transition, value, token_count)
+            )
+            self._hold_phase = "body"
+            return []
+
+        self._held_raw.append(value)
+        events = self._run_transition(transition, value, token_count)
+        self._held_events.extend(events)
+        if any(e.type is EventType.TOOL_CALL_END for e in events):
+            held = self._held_events
             self._clear_hold()
-            events.extend(self._run_transition(transition, value, token_count))
-            return events
-        return self._abort_hold("".join(self._held_raw) + value)
+            return held
+        return []
 
     def _abort_hold(self, raw: str) -> list[SemanticEvent]:
         """Discard held events and re-emit the raw text as content."""
@@ -637,6 +683,7 @@ class StreamingParserEngine:
 
     def _clear_hold(self) -> None:
         self._hold_active = False
+        self._hold_phase = "name"
         self._held_events = []
         self._held_raw = []
         self._held_name = []
