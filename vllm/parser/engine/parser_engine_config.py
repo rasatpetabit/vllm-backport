@@ -109,6 +109,15 @@ class ParserEngineConfig:
     # Reject tool calls whose names are absent from the request tools.
     validate_tool_names: bool = False
 
+    # Commit tool markup only under strict admission: a request that
+    # cannot yield a tool call (no tools declared, or tool_choice "none")
+    # renders tool markup as plain content, and a *recovered* call — one
+    # rebuilt without its opening wrapper — is committed only when the
+    # block actually closes and carries the tool's required parameters.
+    # Derived fresh per request, never latched on the reused engine.
+    # Off by default: consumers without the flag keep today's behaviour.
+    strict_tool_call_admission: bool = False
+
     def terminal_literal(self, name: str) -> str | None:
         """Canonical spelling of terminal *name*, or ``None`` if undeclared."""
         value = self.terminals.get(name)

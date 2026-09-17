@@ -117,6 +117,11 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
             param_re=_PARAM_RE,
             partial_param_re=_PARTIAL_PARAM_RE,
         ),
+        # V4.1 quotes DSML syntax inside prose and reasoning; without
+        # strict admission those quotes become phantom tool calls and
+        # truncated content.  V4 and every other consumer keep the
+        # default (today's behaviour).
+        strict_tool_call_admission=True,
     )
 
 
