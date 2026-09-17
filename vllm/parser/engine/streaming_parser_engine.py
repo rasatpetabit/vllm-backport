@@ -5,6 +5,7 @@ incremental lexing, and state-machine-driven semantic event emission."""
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -181,6 +182,12 @@ class StreamingParserEngine:
         # consumed and then suppressed.  Set per request by the owning
         # ParserEngine; survives reset() like ``skip_tool_parsing``.
         self.suppress_tool_calls = False
+        # Required parameter names per declared tool, or None when unknown.
+        # Consulted only when deciding whether to commit a *recovered*
+        # tool call, which only happens under strict admission.  Set per
+        # request by the owning ParserEngine alongside
+        # ``allowed_tool_names``; survives reset() the same way.
+        self.required_tool_params: dict[str, frozenset[str]] | None = None
         self.reset(initial_state=initial_state)
 
     @property
@@ -650,8 +657,13 @@ class StreamingParserEngine:
         # wrapper — ordinary prose quoting an invoke marker carries a
         # real tool name too.  Such a block is only real if it actually
         # closes, so the hold continues through the body until a
-        # TOOL_CALL_END arrives.  Prose never produces one, and
-        # ``finish`` releases the held text as content when none does.
+        # TOOL_CALL_END arrives; ``finish`` releases the held text as
+        # content when none ever does.
+        #
+        # Closing is necessary but not sufficient — prose explaining how
+        # to close a block writes the closing marker too — so a recovered
+        # call must also carry the arguments its tool requires.  See
+        # ``_recovered_call_is_usable``.
         if self._hold_phase == "name":
             name = "".join(self._held_name)
             allowed = self.allowed_tool_names
@@ -668,10 +680,49 @@ class StreamingParserEngine:
         events = self._run_transition(transition, value, token_count)
         self._held_events.extend(events)
         if any(e.type is EventType.TOOL_CALL_END for e in events):
+            if not self._recovered_call_is_usable():
+                return self._abort_hold("".join(self._held_raw))
             held = self._held_events
             self._clear_hold()
             return held
         return []
+
+    def _recovered_call_is_usable(self) -> bool:
+        """Whether a held, recovered call carries the arguments it needs.
+
+        A recovered call is a guess: the invoke marker is ordinary text,
+        so prose quoting a declared tool is indistinguishable from a real
+        invoke at the token level.  What does separate them is the
+        payload — a genuine call supplies the tool's required parameters,
+        prose supplies a sentence.  Rejecting here re-emits the whole held
+        span as content, which is what the text was to begin with.
+
+        A tool that requires nothing stays ambiguous by construction and
+        is accepted, as is the case where the request's schema is unknown.
+        An engine without an arg_converter emits argument chunks that are
+        already JSON, so the gate checks them directly.  Reached only on
+        the strict_tool_call_admission path.
+        """
+        required = self.required_tool_params
+        if not required:
+            return True
+        needed = required.get("".join(self._held_name))
+        if not needed:
+            return True
+        converter = self.config.arg_converter
+        raw_args = "".join(
+            e.value
+            for e in self._held_events
+            if e.type is EventType.ARG_VALUE_CHUNK
+        )
+        try:
+            provided = json.loads(
+                converter(raw_args, False) if converter is not None
+                else raw_args
+            )
+        except (TypeError, ValueError, RecursionError):
+            return False
+        return isinstance(provided, dict) and needed <= provided.keys()
 
     def _abort_hold(self, raw: str) -> list[SemanticEvent]:
         """Discard held events and re-emit the raw text as content."""

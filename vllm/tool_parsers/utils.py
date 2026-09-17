@@ -307,6 +307,44 @@ def collect_tool_names(tools: list[Tool] | None) -> frozenset[str]:
     return frozenset(names)
 
 
+def collect_required_tool_params(
+    tools: list[Tool] | None,
+) -> dict[str, frozenset[str]]:
+    """Map each declared function tool to its required parameter names.
+
+    Tools that require nothing are still present, mapped to an empty set,
+    so callers can tell "declares no requirements" from "not declared".
+    """
+    if not tools:
+        return {}
+    required: dict[str, frozenset[str]] = {}
+    for tool in tools:
+        if isinstance(tool, (FunctionTool, NamespaceTool)):
+            for name, params in iter_response_function_tool_info(tool):
+                required[name] = _required_param_names(params)
+            continue
+        if not _is_function_tool(tool):
+            continue
+        name, params = _extract_tool_info(tool)
+        required[name] = _required_param_names(params)
+    return required
+
+
+def _required_param_names(params: dict | None) -> frozenset[str]:
+    """A schema's "required" is only trusted when it is a list of names.
+
+    Request models accept arbitrary schema dictionaries, so "required" may
+    be null, a string, or garbage; anything but a list of strings means no
+    checkable requirements.
+    """
+    needed = (params or {}).get("required")
+    if not isinstance(needed, list):
+        return frozenset()
+    if not all(isinstance(n, str) for n in needed):
+        return frozenset()
+    return frozenset(needed)
+
+
 def find_tool_name(
     tools: list[Tool] | None,
     tool_name: str,
