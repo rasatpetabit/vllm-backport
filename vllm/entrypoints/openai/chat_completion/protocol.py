@@ -674,6 +674,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default_sampling_params: dict,
     ) -> SamplingParams:
         # Default parameters
+        # An omitted penalty inherits the server default; an explicit zero
+        # remains an opt-out. Pydantic's numeric default alone cannot tell
+        # those two requests apart.
+        frequency_penalty = self.frequency_penalty
+        if (
+            "frequency_penalty" not in self.model_fields_set
+            or frequency_penalty is None
+        ):
+            frequency_penalty = default_sampling_params.get("frequency_penalty", 0.0)
         if (repetition_penalty := self.repetition_penalty) is None:
             repetition_penalty = default_sampling_params.get(
                 "repetition_penalty",
@@ -722,7 +731,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
-            frequency_penalty=self.frequency_penalty,
+            frequency_penalty=frequency_penalty,
             repetition_penalty=repetition_penalty,
             temperature=temperature,
             watermarking=self.watermarking,
