@@ -456,7 +456,16 @@ class StreamingParserEngine:
         if self.skip_reasoning_parsing and terminal in self._reasoning_markup_terminals:
             return self._emit_for_state(value, token_count)
 
-        if self.skip_tool_parsing and terminal in self._tool_terminals:
+        # Under strict admission an active suppression means this request
+        # can never yield a tool call, so tool terminals are just text the
+        # model wrote; without the flag, suppression diverts recovery only
+        # and terminals keep their normal transitions.
+        suppress_as_content = (
+            self.config.strict_tool_call_admission and self.suppress_tool_calls
+        )
+        if (
+            self.skip_tool_parsing or suppress_as_content
+        ) and terminal in self._tool_terminals:
             # Inkling reuses one terminal for tool, text, and reasoning exits.
             # Outside a forwarded tool span, apply its normal transition.
             is_opener = transition.next_state in self._TOOL_STATES
@@ -473,10 +482,18 @@ class StreamingParserEngine:
                 if leaving_message_header:
                     self._message_header_buffer = ""
                     self._message_header_token_count = 0
-                # A tool terminal that implicitly ends reasoning must report
-                # that even from the header state, or the reasoning pass never
-                # hands the block to the tool pass.
-                if EventType.REASONING_END in transition.events:
+                # Reasoning ends here only when a tool call is actually
+                # possible — the terminal then marks the real end of thinking.
+                # When the request can never yield one the terminal is just
+                # text the model wrote, often while narrating DSML syntax
+                # inside <think>, so reasoning has to continue.  Ending it
+                # would flush the rest of the thoughts into the content.
+                # A skip_tool_parsing pass still reports REASONING_END so
+                # the reasoning adapter hands the block to the tool pass.
+                if (
+                    not suppress_as_content
+                    and EventType.REASONING_END in transition.events
+                ):
                     self.state = ParserState.CONTENT
                     return [
                         SemanticEvent(
