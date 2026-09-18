@@ -25,8 +25,10 @@ import re
 from typing import Any, cast
 
 import pytest
+import torch
 
 from vllm.distributed.utils import balanced_row_counts
+from vllm.v1.attention.backends.mla import indexer
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerPrefillChunkMetadata,
     indexer_decode_shard_bounds,
@@ -710,26 +712,79 @@ def test_mixed_prefill_and_decode_halves_cannot_disagree():
             )
 
 
-def test_sm80_native_decode_decision_is_gpu_only():
-    """Skip-with-reason: the capability-8.0 flattening decision needs a GPU.
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason=(
+        "capability-8.0 native-decode decision: a CPU host reaches it only "
+        "through a monkeypatched capability family, so the real-hardware "
+        "observation needs a CUDA device"
+    ),
+)
+def test_sm80_native_decode_decision_is_gpu_only(monkeypatch):
+    """The capability-8.0 flattening decision, observed on real SM80 silicon.
 
-    ``_supports_native_decode(6)`` reads ``current_platform.is_cuda()`` and
-    ``has_deep_gemm()`` before it ever consults the capability family, so on
-    this CPU host it returns False for a reason unrelated to SM80 and asserting
-    it here would pass without testing the branch. The CPU-testable consequence
-    -- the group-to-token-row mapping the flattened path relies on -- is
-    ``test_flattened_next_n_6_maps_groups_to_token_rows``.
+    ``_supports_native_decode`` short-circuits on ``has_deep_gemm()`` *before*
+    it consults the capability family, so a host without deep_gemm returns
+    ``next_n in (1, 2)`` for a reason unrelated to SM80 -- asserting it there
+    would pass without touching the branch this arm exists to observe. The
+    deployed image ships **no deep_gemm** (measured on device, this run), so
+    ``has_deep_gemm`` is forced True purely to let the real capability family
+    be reached; every check below it then reads the actual A100.
 
-    GPU design: on an A100 (capability 8.0) with deep_gemm available, assert
-    ``_supports_native_decode(6) is False`` and ``_supports_native_decode(1) is
-    True``, and that ``_use_flattening`` is True for a VllmConfig with
-    num_speculative_tokens=5 and no adaptive verification; then capture a
-    decode batch and assert the metadata builder's ``batch_size`` equals the
-    flattened token count rather than the request count.
+    Asserted: on capability 8.0, ``next_n`` 1 and 2 are native and 3, 4 and 6
+    are not -- so the lane's DSpark shape (``next_n = 1 + 5 = 6``) flattens.
+    The consequence for the decision function is pinned at source level rather
+    than through a fabricated ``VllmConfig``: a real one needs
+    ``speculative_config.target_model_config`` for ``method="dspark"``, which
+    is the served model's own config and is not constructible in a unit test.
     """
-    pytest.skip(
-        "capability-8.0 native-decode decision requires a CUDA device and "
-        "deep_gemm; CPU host cannot reach that branch"
+    import inspect
+
+    from vllm.utils.deep_gemm import has_deep_gemm
+
+    capability = torch.cuda.get_device_capability(0)
+    print(
+        f"SM80 ARM: has_deep_gemm()={has_deep_gemm()} on "
+        f"{torch.cuda.get_device_name(0)} capability={capability}",
+        flush=True,
+    )
+    if capability != (8, 0):
+        pytest.skip(f"this host is capability {capability}, not (8, 0)")
+
+    monkeypatch.setattr(indexer, "has_deep_gemm", lambda: True)
+    check(
+        indexer._supports_native_decode(1) is True,
+        "next_n=1 must be native on capability 8.0",
+    )
+    check(
+        indexer._supports_native_decode(2) is True,
+        "next_n=2 must be native on capability 8.0",
+    )
+    for next_n in (3, 4, 6):
+        check(
+            indexer._supports_native_decode(next_n) is False,
+            f"next_n={next_n} must flatten on capability 8.0, but the gate "
+            "says native",
+        )
+
+    # The decision function's first disjunct is the gate above; with it False
+    # at next_n=6, no speculative config can make _use_flattening return False.
+    flattening_src = inspect.getsource(indexer._use_flattening)
+    check(
+        "not _supports_native_decode(next_n)" in flattening_src,
+        "_use_flattening no longer short-circuits on _supports_native_decode; "
+        "the SM80 flattening consequence asserted here is stale",
+    )
+    check(
+        "next_n = 1 + vllm_config.num_speculative_tokens" in flattening_src,
+        "_use_flattening no longer derives next_n as 1 + "
+        "num_speculative_tokens; the DSpark next_n=6 reasoning is stale",
+    )
+    print(
+        "SM80 ARM RESULT: capability 8.0 -> native next_n {1,2}; at the "
+        "DSpark shape next_n=6 the indexer decode path flattens, and "
+        "_use_flattening's first disjunct is that same gate.",
+        flush=True,
     )
 
 
