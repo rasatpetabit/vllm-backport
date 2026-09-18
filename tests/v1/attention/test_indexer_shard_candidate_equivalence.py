@@ -87,16 +87,25 @@ def candidate_mask_columns(
     ``valid = (cols >= start) & (cols < end) & (cols < width)`` (``:128``);
     ``block = (cols - start) // BLOCK_SIZE`` (``:129``); ``keep = flags[block]``
     for valid columns (``:130``); plus the edge rule
-    ``(cols == width - 1) & flags[nblocks]`` (``:132``). Everything else is
-    written to ``-inf`` (``:136``).
+    ``(cols == width - 1) & flags[nblocks]`` (``:132``).
+
+    The store predicate is ``(cols < width) & ~(valid & keep)`` (``:136``), so
+    preservation requires **``valid AND keep``**: the edge flag ORs into ``keep``
+    but does *not* rescue the boundary column from causal masking. When
+    ``end <= width - 1`` the boundary column is therefore masked despite the
+    edge flag. ``end`` is a per-row causal bound while ``width`` is the buffer
+    width, so decode rows whose max context is shorter than the batch's have
+    ``end < width`` -- a reachable production case, not a degenerate one.
     """
     flags = normalize_candidates(candidates, start, width, block_size, nblocks)
     keep = set()
     for col in range(width):
         valid = start <= col < end and col < width
-        if valid and (col - start) // block_size in flags:
-            keep.add(col)
-        elif col == width - 1 and nblocks in flags:
+        if not valid:
+            continue
+        in_candidate_block = (col - start) // block_size in flags
+        is_edge_column = col == width - 1 and nblocks in flags
+        if in_candidate_block or is_edge_column:
             keep.add(col)
     return keep
 
@@ -126,6 +135,15 @@ def _producer_block_scores(
 def _top_k(values: list[float], k: int) -> list[int]:
     """Indices of the k largest values, best first, ties to the lower index.
 
+    **This tie-break is a modelling choice, not a kernel contract.** The real
+    producer is ``scores.topk(...)`` at ``candidate_blocks.py:179``, whose tie
+    order is deliberately unspecified -- the comment at ``:178`` says "Keep the
+    existing top-k tie behavior", i.e. torch's own order is preserved rather
+    than defined. Any assertion comparing this function's *output order* across
+    two arms therefore asserts something the hardware does not promise; the
+    equivalence arms use ``_top_k_set`` instead, which compares sets and
+    refuses an ambiguous tie straddling the k-th place.
+
     ``-inf`` entries are *not* filtered: the row top-k kernels do emit indices
     for every one of their k slots, so keeping them models the consumer
     faithfully. Callers that need a directly comparable pair of arms assert
@@ -133,6 +151,62 @@ def _top_k(values: list[float], k: int) -> list[int]:
     """
     order = sorted(range(len(values)), key=lambda i: (-values[i], i))
     return order[:k]
+
+
+def _top_k_set(values: list[float], k: int, column_ids: list[int]) -> set[int]:
+    """The *set* of the ``k`` best-scoring ``column_ids``.
+
+    Used where order is genuinely unspecified (``candidate_blocks.py:178``):
+    two arms must agree on *which* columns they select, not on the order a
+    particular top-k implementation emits ties in. Ties straddling the k-th
+    place make even the selected *set* ambiguous, so this refuses that case
+    loudly instead of resolving it by accident of a sort key.
+    """
+    if k >= len(column_ids):
+        return set(column_ids)
+    ranked = sorted(range(len(values)), key=lambda i: -values[i])
+    boundary = values[ranked[k - 1]]
+    if values[ranked[k]] == boundary:
+        raise AssertionError(
+            f"a tie straddles the k-th place (value {boundary!r} at both "
+            f"rank {k - 1} and rank {k}): the selected set is ambiguous, so "
+            "this comparison would not be well defined"
+        )
+    return {column_ids[i] for i in ranked[:k]}
+
+
+def _independent_candidate_columns(
+    candidates: Iterable[int],
+    start: int,
+    end: int,
+    width: int,
+    block_size: int,
+    nblocks: int,
+) -> set[int]:
+    """The restricted-scoring arm's column set, derived independently.
+
+    A *second, independent statement* of the contract ``candidate_mask_columns``
+    models: it expands each candidate block id straight into its packed-column
+    range, instead of iterating columns and asking whether each one is flagged.
+    The two derivations must agree, and are deliberately not written in terms of
+    one another, so a wrong edge rule or a wrong start-relative origin in either
+    one makes the equivalence arms disagree rather than cancelling out.
+
+    Block ``b`` covers ``[start + b*block_size, ...)`` -- start-relative, per
+    ``candidate_blocks.py:129`` -- clipped to the causal window ``[start, end)``
+    and the packed width. The sentinel ``nblocks`` pins the newest packed column
+    ``width - 1``, which ``:136`` preserves only when that column is *valid*.
+    """
+    columns: set[int] = set()
+    for b in candidates:
+        if b < 0 or b == nblocks:
+            continue
+        lo = start + b * block_size
+        hi = min(lo + block_size, end, width)
+        columns.update(range(lo, hi))
+    if nblocks in candidates and start <= width - 1 < end:
+        columns.add(width - 1)
+    return columns
 
 
 def select_candidates(
@@ -217,6 +291,42 @@ def test_a_context_shorter_than_the_candidate_set_can_never_be_masked():
                 )
 
 
+def test_the_edge_column_is_masked_when_the_causal_window_ends_before_it():
+    """The edge flag ORs into ``keep``; it does not override causal masking.
+
+    ``candidate_blocks.py:136`` stores ``-inf`` where ``(cols < width) &
+    ~(valid & keep)``, so the boundary column ``width - 1`` survives only when
+    it is *valid*, i.e. ``start <= width - 1 < end``. With ``end < width`` the
+    edge flag is set but the column is still masked. This is the ragged-tail
+    case: ``end`` is a per-row causal bound and ``width`` is the buffer width,
+    so a decode row whose context is shorter than the batch maximum has
+    ``end < width`` -- exactly the rows the shard exists to distribute.
+    """
+    block_size, width, nblocks = 8, 64, 8
+
+    # end == width - 1: the boundary column is one past the causal window.
+    kept = candidate_mask_columns([nblocks], 0, width - 1, width, block_size, nblocks)
+    check(
+        width - 1 not in kept,
+        f"edge column {width - 1} kept although end={width - 1} makes it "
+        "invalid; the kernel requires valid AND keep",
+    )
+
+    # end == width: the same candidate now does keep the boundary column.
+    kept = candidate_mask_columns([nblocks], 0, width, width, block_size, nblocks)
+    check(
+        kept == {width - 1},
+        f"a valid boundary column must be kept by the edge rule, got {sorted(kept)}",
+    )
+
+    # A short row: no candidate block can be valid at all, edge flag or not.
+    kept = candidate_mask_columns([nblocks], 0, 5, width, block_size, nblocks)
+    check(
+        kept == set(),
+        f"a row with end=5 must mask everything, got {sorted(kept)}",
+    )
+
+
 def test_the_producers_pinned_newest_block_always_survives_the_mask():
     """The ``+inf`` pin guarantees the newest compressed position is visible.
 
@@ -251,65 +361,182 @@ def test_candidate_restricted_scoring_selects_the_same_indices_as_masking():
     Arm A (what the shipped consumers do): take full-width scores, apply the
     candidate mask, take the row top-k. Arm B (the compact formulation): keep
     only the candidate columns, top-k among them, map back to request-local
-    positions. The fixture is built so the mask *does* change the answer
-    relative to unmasked full-width top-k, otherwise the comparison would pass
-    vacuously.
+    positions.
+
+    The two arms are **independent computations**, not one expression rewritten:
+    arm A gets its live-column set from ``candidate_mask_columns`` (iterate
+    columns, test the flag) while arm B gets it from
+    ``_independent_candidate_columns`` (expand each block id into its range),
+    and each selects from its own list. Mutating either derivation -- the edge
+    rule, the start-relative origin, the causal clip -- makes them disagree.
+
+    The batch is multi-row because rows are the dimension the shard splits, with
+    per-row candidate sets, a ragged tail (``end < width`` on the later rows) and
+    ties inside a block. The selection comparison is on index *sets*, because
+    ``candidate_blocks.py:178`` deliberately leaves top-k tie order unspecified.
     """
     block_size, width, topk_blocks, topk_tokens = 8, 64, 4, 16
     nblocks = -(-width // block_size)  # 8
-    start, end = 0, width
 
-    # Block 0 and the pinned block 7 are the signal; blocks 5 and 3 have the
-    # next-best block maxima. Block 6 (all columns at 7.5) loses the block
-    # top-k, but its columns still outrank the *low* columns of the selected
-    # blocks -- so the mask is what removes them from the row top-k.
-    scores = [0.05] * width
-    for col in range(0, block_size):
-        scores[col] = 50.0 + col
-    scores[3 * block_size] = 8.0
-    scores[5 * block_size] = 9.0
-    for col in range(6 * block_size, 7 * block_size):
-        scores[col] = 7.5
+    # (start, end, mid_block, dropped_block). Block ids are start-relative
+    # (``candidate_blocks.py:129``), so a row with ``start > 0`` is the case that
+    # distinguishes a start-relative origin from a global one -- the load-bearing
+    # choice for the sharding composition. ``dropped_block`` must not be the
+    # pinned newest block (``_block_scores_kernel:46-50``), which is always a
+    # candidate; with ``start > 0`` the newest block shifts, so the block that
+    # loses the block top-k shifts with it.
+    rows = [
+        (0, width, 3, 6),
+        (block_size, width, 3, 2),
+        (0, width - 1, 3, 6),
+        (0, 5 * block_size, 3, 6),
+    ]
+    signals = [(0.0, 5.0), (0.0, 5.0), (0.0, 3.0), (0.0, 1.0)]
 
-    candidates = select_candidates(scores, start, end, block_size, topk_blocks)
-    check(-1 not in candidates, f"the row is long enough to fill top-k: {candidates}")
+    for row, (start, end, mid_block, dropped_block) in enumerate(rows):
+        mid_lo, mid_hi = signals[row]
+
+        # Block 0 and the pinned newest block are the signal; `mid_block` holds
+        # the next-best block maximum. `dropped_block` (all columns at 7.5) loses
+        # the block top-k, but its columns still outrank the *low* columns of the
+        # selected blocks -- so the mask is what removes them from the row top-k.
+        #
+        # The filler is strictly increasing in the column index: a tie at the
+        # k-th place would make the selected *set* itself ambiguous, and
+        # `_top_k_set` refuses that rather than resolving it by sort order. Ties
+        # inside the selection are exercised by the block-0 pair below.
+        scores = [0.05 + 0.0001 * col for col in range(width)]
+        for col in range(start, start + block_size):
+            scores[col] = 50.0 + (col - start)
+        scores[start] = scores[start + 1] = 50.0
+        scores[start + mid_block * block_size] = 8.0 + mid_lo
+        scores[start + 5 * block_size] = 9.0 + mid_hi
+        lo = start + dropped_block * block_size
+        for col in range(lo, lo + block_size):
+            scores[col] = 7.5 + 0.0001 * col
+
+        candidates = select_candidates(scores, start, end, block_size, topk_blocks)
+        check(-1 not in candidates, f"row {row}: top-k not filled: {candidates}")
+        check(
+            len(set(candidates)) == topk_blocks,
+            f"row {row}: candidates must be distinct, got {candidates}",
+        )
+
+        # Arm A: the mask's column set, then top-k over the full-width row.
+        kept = candidate_mask_columns(
+            candidates, start, end, width, block_size, nblocks
+        )
+        check(
+            len(kept) >= topk_tokens,
+            f"row {row}: need >= {topk_tokens} live columns for a comparable "
+            f"pair of arms, got {len(kept)}",
+        )
+        masked = [scores[c] if c in kept else float("-inf") for c in range(width)]
+        arm_a = _top_k_set(masked, topk_tokens, list(range(width)))
+
+        # Arm B: independently derived candidate columns, top-k over just those.
+        restricted = _independent_candidate_columns(
+            candidates, start, end, width, block_size, nblocks
+        )
+        check(
+            restricted == kept,
+            f"row {row}: the two derivations of the candidate columns disagree: "
+            f"mask={sorted(kept)} independent={sorted(restricted)}",
+        )
+        compact = sorted(restricted)
+        arm_b = _top_k_set([scores[c] for c in compact], topk_tokens, compact)
+
+        check(
+            arm_a == arm_b,
+            f"row {row}: arms disagree: masked={sorted(arm_a)} "
+            f"compact={sorted(arm_b)}",
+        )
+
+        # Non-vacuity, both halves: the mask must have removed at least one
+        # position the unmasked full-width top-k would have taken, and every
+        # position it removed must belong to a block that was not a candidate.
+        unmasked_topk = set(_top_k(scores, topk_tokens))
+        dropped = [c for c in unmasked_topk if c not in kept]
+        check(
+            dropped,
+            f"row {row}: fixture is vacuous, the candidate mask changed nothing",
+        )
+        dropped_blocks = {(c - start) // block_size for c in dropped}
+        check(
+            not (dropped_blocks & set(candidates)),
+            f"row {row}: the mask dropped columns {dropped} from selected "
+            f"blocks {sorted(dropped_blocks & set(candidates))}",
+        )
+
+
+def test_the_two_arms_agree_over_a_ragged_tail_sweep():
+    """The equivalence must hold for every ``end``, not just a full-width row.
+
+    ``end`` is a per-row causal bound, so a real batch carries a different one
+    per row and index-mapping errors live exactly at the ragged boundary -- the
+    case the single-row full-width fixture could not reach. Swept over
+    ``end in [1, width]`` so the boundary, the partially-visible block and the
+    degenerate ``end <= start`` cases are all covered.
+    """
+    block_size, width, topk_blocks, topk_tokens = 8, 64, 4, 16
+    nblocks = -(-width // block_size)
+
+    for end in range(1, width + 1):
+        scores = [0.05 + 0.0001 * col for col in range(width)]
+        for col in range(0, block_size):
+            scores[col] = 50.0 + col
+        scores[3 * block_size] = 8.0
+        scores[5 * block_size] = 9.0
+        for col in range(6 * block_size, 7 * block_size):
+            scores[col] = 7.5 + 0.0001 * col
+
+        candidates = select_candidates(scores, 0, end, block_size, topk_blocks)
+        kept = candidate_mask_columns(candidates, 0, end, width, block_size, nblocks)
+        if len(kept) < topk_tokens:
+            # Fewer live columns than the row top-k width: the arms are not
+            # comparable (the ``-inf`` pads would enter the comparison).
+            continue
+
+        masked = [scores[c] if c in kept else float("-inf") for c in range(width)]
+        arm_a = _top_k_set(masked, topk_tokens, list(range(width)))
+        compact = sorted(
+            _independent_candidate_columns(
+                candidates, 0, end, width, block_size, nblocks
+            )
+        )
+        arm_b = _top_k_set([scores[c] for c in compact], topk_tokens, compact)
+        check(
+            arm_a == arm_b,
+            f"end={end}: arms disagree: masked={sorted(arm_a)} "
+            f"compact={sorted(arm_b)} candidates={candidates}",
+        )
+
+
+def test_a_tie_at_the_top_k_boundary_is_rejected_not_silently_resolved():
+    """Ties are compared as sets; an ambiguous tie is refused explicitly.
+
+    ``candidate_blocks.py:178-179`` preserves torch's tie order rather than
+    defining one, so nothing may depend on *which* of two equal scores is
+    selected when the tie straddles the k-th place. ``_top_k_set`` compares the
+    selected columns as a set, and raises when the tie makes even that set
+    ambiguous -- so a fixture can never quietly encode an ordering assumption
+    the kernels do not make.
+    """
+    # Ties entirely inside the selection are fine: the same set is chosen, so
+    # nothing depends on which of them a top-k implementation emits first.
     check(
-        set(candidates) == {7, 0, 5, 3},
-        f"unexpected candidate set {sorted(candidates)}",
+        _top_k_set([1.0, 1.0, 1.0, 0.0], 3, [0, 1, 2, 3]) == {0, 1, 2},
+        "ties inside the selection must not change the selected set",
     )
 
-    kept = candidate_mask_columns(candidates, start, end, width, block_size, nblocks)
+    # A tie straddling the k-th place is ambiguous and must be refused.
+    with pytest.raises(AssertionError, match="straddles the k-th place"):
+        _top_k_set([1.0, 0.5, 0.5], 2, [0, 1, 2])
+
+    # k >= the number of columns: every column is selected, no ordering needed.
     check(
-        len(kept) >= topk_tokens,
-        f"need >= {topk_tokens} live columns for a comparable pair of arms, "
-        f"got {len(kept)}",
-    )
-
-    # Arm A: mask (unselected columns -> -inf), then top-k.
-    masked = [scores[c] if c in kept else float("-inf") for c in range(width)]
-    arm_a = _top_k(masked, topk_tokens)
-
-    # Arm B: compact matrix of only the candidate columns, top-k, map back.
-    compact = sorted(kept)
-    arm_b = [compact[i] for i in _top_k([scores[c] for c in compact], topk_tokens)]
-
-    check(arm_a == arm_b, f"arms disagree: masked={arm_a} compact={arm_b}")
-
-    # Non-vacuity, both halves: the mask must have removed at least one
-    # position the unmasked full-width top-k would have taken, and every
-    # position it removed must belong to a block that was not a candidate.
-    unmasked_topk = _top_k(scores, topk_tokens)
-    dropped = [c for c in unmasked_topk if c not in kept]
-    check(
-        dropped,
-        "fixture is vacuous: the candidate mask changed nothing, so this "
-        "comparison cannot fail",
-    )
-    dropped_blocks = {c // block_size for c in dropped}
-    check(
-        not (dropped_blocks & set(candidates)),
-        f"the mask dropped columns {dropped} from selected blocks "
-        f"{sorted(dropped_blocks & set(candidates))}",
+        _top_k_set([1.0, 0.5], 5, [0, 1]) == {0, 1},
+        "a short row must select every column",
     )
 
 
