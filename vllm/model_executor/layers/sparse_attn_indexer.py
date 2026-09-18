@@ -781,6 +781,35 @@ def sparse_attn_indexer(
         # and all-reduce the top-k back to the full buffer below. The builder
         # partitioned this same `batch_size`, so nothing is re-partitioned here.
         shard_bounds = decode_metadata.shard_bounds
+        # The candidate buffer's producer (layer `candidate_source_layer_id`)
+        # and its consumers each derive their row slice from replicated batch
+        # metadata; a future change that made the decode shape layer-dependent
+        # would silently mask the wrong rows (wrong top-k indices, no crash).
+        # The producer records the shape it published under and each consumer
+        # checks its own against it.
+        #
+        # Recorded on the candidate buffer, which is the one object every
+        # candidate layer shares (`model.py:444-451` -> `attention.py:413-417`
+        # -> here). A record on `decode_metadata` would be inert whenever the
+        # producer and a consumer land in different attn groups, since each
+        # group builds its own metadata object. It cannot go stale: layer
+        # `candidate_source_layer_id` always executes its decode branch before
+        # any consumer does, so every step refreshes the record before it is
+        # read.
+        #
+        # Free in the hot path: host-side ints only, no tensor work, no
+        # allocation, no collective, no shape change, and the branch is on
+        # Python values that are fixed across replays of a captured graph.
+        if candidate_blocks is not None:
+            batch_shape = (batch_size, next_n, shard_bounds)
+            if candidate_write:
+                candidate_blocks.producer_batch_shape = batch_shape
+            else:
+                recorded = getattr(candidate_blocks, "producer_batch_shape", None)
+                assert recorded is None or recorded == batch_shape, (
+                    "indexer decode batch shape changed between the candidate "
+                    f"producer and a consumer: {recorded} != {batch_shape}"
+                )
         group_lo, group_hi = shard_bounds or (0, batch_size)
         assert 0 <= group_lo < group_hi <= batch_size
         row_lo, row_hi = indexer_decode_shard_rows(shard_bounds, batch_size, next_n)
