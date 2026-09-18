@@ -21,6 +21,7 @@ Runs without a GPU on purpose, like its siblings: the regressions guarded here
 are silent, so their guards must not depend on scarce hardware.
 """
 
+import re
 from typing import Any, cast
 
 import pytest
@@ -54,6 +55,59 @@ GRAPH_PAD_BATCHES = (6, 12, 24, 48, 96, 128, 192, 256, 384)
 def check(cond: bool, msg: str) -> None:
     if not cond:
         FAILURES.append(msg)
+
+
+def check_exact_line(src: str, line: str, msg: str) -> None:
+    """Anchor a shipped statement as a whole source line, not a substring.
+
+    `line in src` passes when the pinned statement was deleted from the real
+    site but an identical string survives elsewhere -- a comment, a docstring,
+    a second overload. Anchoring the whole line (indentation aside) makes the
+    pin exact, so one occurrence is one statement.
+    """
+    check(
+        re.search(rf"^\s*{re.escape(line)}\s*$", src, re.MULTILINE) is not None,
+        msg,
+    )
+
+
+def _line_span(src: str, line: str) -> tuple[int, int] | None:
+    """Span of the whole-line match for ``line``, or None if absent."""
+    match = re.search(rf"^[ \t]*{re.escape(line)}[ \t]*$", src, re.MULTILINE)
+    return match.span() if match else None
+
+
+def check_gap_statement_set(
+    src: str, first: str, last: str, identifiers: tuple, expected: tuple, msg: str
+) -> None:
+    """Anchor what happens *between* two shipped statements.
+
+    Two line anchors pin two statements and nothing in between, so a new
+    statement inserted in the gap leaves both green while changing behaviour.
+    This pins the gap's content: the set of non-comment source lines between
+    ``first`` and ``last`` that mention any of ``identifiers`` must be exactly
+    ``expected`` (each a stripped source line). Comment lines are ignored so
+    rewording a comment is not a false failure.
+
+    If either endpoint line is missing, the line anchors already report it and
+    this check stays silent rather than double-reporting a derived failure.
+    """
+    first_span = _line_span(src, first)
+    last_span = _line_span(src, last)
+    if first_span is None or last_span is None:
+        return
+    gap = src[first_span[1] : last_span[0]]
+    found = {
+        line.strip()
+        for line in gap.splitlines()
+        if not line.strip().startswith("#")
+        and any(name in line for name in identifiers)
+    }
+    check(
+        found == set(expected),
+        f"{msg}; the gap between the two anchored statements now contains "
+        f"{sorted(found)}, expected {sorted(expected)}",
+    )
 
 
 def teardown_function(function) -> None:
@@ -204,12 +258,14 @@ def test_layer_roles_match_the_shipped_predicates():
         f"deepseek_v4_1 attention source not found at {v41_attention_path}",
     )
     src = v41_attention_path.read_text()
-    check(
-        "is_candidate_source = layer_id == self.candidate_source_layer" in src,
+    check_exact_line(
+        src,
+        "is_candidate_source = layer_id == self.candidate_source_layer",
         "candidate source predicate moved or changed shape",
     )
-    check(
-        "uses_candidates = 0 <= self.candidate_source_layer < layer_id" in src,
+    check_exact_line(
+        src,
+        "uses_candidates = 0 <= self.candidate_source_layer < layer_id",
         "candidate consumer predicate moved or changed shape",
     )
     # The consumer's read range is the one shipped expression
@@ -225,11 +281,53 @@ def test_layer_roles_match_the_shipped_predicates():
         f"sparse_attn_indexer source not found at {indexer_path}",
     )
     indexer_src = indexer_path.read_text()
-    check(
-        "decode_candidates = candidate_blocks[row_lo:row_hi]" in indexer_src,
+    check_exact_line(
+        indexer_src,
+        "decode_candidates = candidate_blocks[row_lo:row_hi]",
         "the consumer's candidate slice moved or changed shape -- the read "
         "range `_consumer_rows` models is no longer what layer 24/28/32/36 "
         "actually reads",
+    )
+    # ...and the provenance of the two bounds that slice consumes. The anchors
+    # above pin the bounds' *computation* (the shard-bounds call) and their
+    # *consumption* (the slice), but nothing between them: an offset, clamp,
+    # reorder, or added per-layer/write-flag branch inserted in that gap leaves
+    # both pinned strings intact. The arithmetic side cannot catch it either --
+    # this module is never imported on a CPU host, so only source text pins
+    # the chain. Between the two statements below, `row_lo`/`row_hi` are read
+    # exactly once (`shard_weights = weights[row_lo:row_hi]`, an unmodified
+    # read) and never reassigned, so the chain is these two assignments.
+    check_exact_line(
+        indexer_src,
+        "row_lo, row_hi = indexer_decode_shard_rows(shard_bounds, batch_size, next_n)",
+        "the decode rows the consumer slices are no longer derived from the "
+        "shard bounds in one assignment -- the bounds were offset, clamped, "
+        "reordered, or produced by a new branch between the shard-bounds call "
+        "and the candidate slice, and neither the slice anchor nor the "
+        "arithmetic comparison covers that gap",
+    )
+    check_exact_line(
+        indexer_src,
+        "shard_weights = weights[row_lo:row_hi]",
+        "the only read of row_lo/row_hi between the shard-bounds call and the "
+        "candidate slice moved or changed shape -- a new statement in that gap "
+        "is where an unowned row range would be introduced",
+    )
+    # The two anchors above pin the endpoints of the chain, and this pins the
+    # gap between them: `row_lo`/`row_hi` are assigned once from the shard
+    # bounds and referenced exactly once before the candidate slice. Anything
+    # else in the gap touching them -- an offset, a clamp, a reorder, a
+    # per-layer or write-flag branch -- changes which rows the consumer reads
+    # while leaving both adjacent anchors intact.
+    check_gap_statement_set(
+        indexer_src,
+        "row_lo, row_hi = indexer_decode_shard_rows(shard_bounds, batch_size, next_n)",
+        "decode_candidates = candidate_blocks[row_lo:row_hi]",
+        ("row_lo", "row_hi"),
+        ("shard_weights = weights[row_lo:row_hi]",),
+        "row_lo/row_hi are no longer carried unchanged from the shard-bounds "
+        "call to the candidate slice -- an unowned row range was introduced "
+        "in the gap, and neither the slice anchor nor the bounds anchor sees it",
     )
     # ...and the partition it reads by is the one rule, not a second policy.
     # `balanced_row_counts` is the single authoritative partition primitive
@@ -241,8 +339,9 @@ def test_layer_roles_match_the_shipped_predicates():
         Path(inspect.getfile(vllm)).parent
         / "v1/attention/backends/mla/indexer.py"
     ).read_text()
-    check(
-        "return balanced_row_bounds(0, batch_size, shard_rank, shard_size)" in shard_src,
+    check_exact_line(
+        shard_src,
+        "return balanced_row_bounds(0, batch_size, shard_rank, shard_size)",
         "the decode shard bounds no longer derive from the one partition rule",
     )
     check(
