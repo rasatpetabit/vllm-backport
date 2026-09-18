@@ -28,6 +28,7 @@ whose on-device design is written out in
 from typing import Iterable
 
 import pytest
+import torch
 
 from vllm.v1.attention.backends.mla.indexer import indexer_decode_shard_rows
 
@@ -614,16 +615,46 @@ def test_candidate_rows_and_topk_rows_use_the_same_shard_mapping():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
+def _device_fixture_config() -> tuple[int, int, int]:
+    """``(candidate_topk_blocks, candidate_block_size, index_topk)``.
+
+    Read from the deployed model config, never hardcoded: the mask is a no-op
+    unless ``candidate_topk_blocks * candidate_block_size < width``, so a stale
+    literal here would make the device arm vacuous instead of failing. The
+    deployed DeepSeek-V4.1 config carries these under ``text_config``; the
+    top level is checked too so a flattened config reads the same way.
+    """
+    import json
+    import os
+
+    with open(
+        os.environ.get(
+            "DSV41_MODEL_CONFIG", "/srv/models/DeepSeek-V4.1-Flash/config.json"
+        )
+    ) as fh:
+        raw = json.load(fh)
+    scopes = [raw.get("text_config") or {}, raw]
+    keys = ("candidate_topk_blocks", "candidate_block_size", "index_topk")
+    for scope in scopes:
+        if all(key in scope for key in keys):
+            return tuple(int(scope[key]) for key in keys)  # type: ignore[return-value]
+    raise KeyError(
+        f"none of {keys} found at the top level or under text_config of the "
+        "deployed model config"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
     reason=(
         "requires CUDA + Triton: drives _block_scores_kernel, "
         "_store_candidates_kernel, _candidate_flags_kernel and "
         "_mask_candidates_kernel on device. The production host has ~386 MiB "
-        "free per GPU beside a live serving lane, so this cannot run here "
-        "without an eviction window; the on-device design is written out in "
+        "free per GPU beside a live serving lane, so this runs only in a "
+        "drained window; the on-device design is written out in "
         "docs/masterplan/dsv41-flash-a100-perf/findings/"
         "ws2b-equivalence-and-r1.md."
-    )
+    ),
 )
 def test_candidate_restricted_scoring_matches_full_width_scoring_on_device():
     """Arm A vs Arm B over the real Triton kernels, on real logits.
@@ -633,10 +664,266 @@ def test_candidate_restricted_scoring_matches_full_width_scoring_on_device():
     through ``col = start + block * candidate_block_size + off``. Assertions:
     identical top-k index sets per row, and a max absolute logit difference of
     0.0 over the candidate columns.
+
+    Multi-row, a ragged causal tail (``end < width``, not block-aligned) and a
+    non-zero ``start`` are all exercised, because those are the shapes the
+    shard exists to distribute. A tie straddling the k-th boundary is probed
+    separately and its **tie order is recorded, not asserted**: the producer
+    keeps torch's unspecified topk order (``candidate_blocks.py:178``), so a
+    particular tie order is not a contract this test may impose.
     """
-    raise AssertionError(
-        "GPU-only test executed on the CPU lane: the skip marker was removed "
-        "without the hardware being available."
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        apply_candidate_mask,
+        select_candidate_blocks,
+    )
+
+    try:
+        topk_blocks, block_size, topk_tokens = _device_fixture_config()
+    except (OSError, KeyError, ValueError) as exc:  # pragma: no cover - env
+        pytest.skip(f"deployed model config unavailable: {exc}")
+
+    dev = torch.device("cuda")
+
+    # Width must exceed topk_blocks * block_size, or the producer's top-k can
+    # never run out of blocks and the mask removes nothing (property 2) -- a
+    # vacuous run that proves nothing.
+    width = topk_blocks * block_size + 4 * block_size
+    nblocks = -(-width // block_size)
+    assert topk_blocks < nblocks, "fixture would be vacuous: mask cannot bite"
+
+    rows = 24
+    generator = torch.Generator(device=dev).manual_seed(20260918)
+    base = torch.randn(
+        rows, width, device=dev, generator=generator, dtype=torch.float32
+    )
+
+    starts = torch.zeros(rows, device=dev, dtype=torch.int32)
+    ends = torch.full((rows,), width, device=dev, dtype=torch.int32)
+    for r in range(6, 12):
+        ends[r] = width - (r - 5) * block_size - (r % 3)  # ragged, unaligned
+    for r in range(12, 18):
+        starts[r] = (r - 11) * block_size  # block ids are start-relative
+        ends[r] = width - (r - 11) * block_size
+
+    workspace = torch.empty(1024 * 1024, device=dev, dtype=torch.uint8)
+
+    # --- Arm A: the shipped consumer path ---------------------------------
+    arm_a_logits = base.clone()
+    candidates = torch.full((rows, topk_blocks), -1, device=dev, dtype=torch.int32)
+    select_candidate_blocks(
+        arm_a_logits, starts, ends, topk_blocks, block_size, candidates, 1
+    )
+    apply_candidate_mask(arm_a_logits, starts, ends, candidates, block_size, 1)
+
+    arm_a_out = torch.full((rows, topk_tokens), -1, device=dev, dtype=torch.int32)
+    torch.ops._C.persistent_topk(
+        arm_a_logits, ends, arm_a_out, workspace, topk_tokens, width
+    )
+
+    # --- Arm B: the compact formulation, derived independently -------------
+    b_ids = candidates.to(torch.int64)
+    offs = torch.arange(block_size, device=dev, dtype=torch.int64)
+    cols = (
+        starts.to(torch.int64)[:, None, None]
+        + b_ids[:, :, None] * block_size
+        + offs[None, None, :]
+    )
+    slot_ok = (
+        (b_ids[:, :, None] >= 0)
+        & (cols < ends.to(torch.int64)[:, None, None])
+        & (cols < width)
+    )
+    compact_cols = torch.where(
+        slot_ok.reshape(rows, -1),
+        cols.reshape(rows, -1),
+        torch.full(
+            (rows, topk_blocks * block_size), -1, device=dev, dtype=torch.int64
+        ),
+    )
+    # The sentinel rule: a candidate whose block starts at/past the logits
+    # width is clamped onto slot ``nblocks`` and keeps only the boundary column
+    # ``width - 1``, and only while that column is causally valid.
+    clamped = (b_ids >= 0) & (
+        starts.to(torch.int64)[:, None] + b_ids * block_size >= width
+    )
+    edge_ok = (
+        clamped.any(dim=1)
+        & (starts.to(torch.int64) <= width - 1)
+        & (width - 1 < ends.to(torch.int64))
+    )
+    compact_cols = torch.cat(
+        [
+            compact_cols,
+            torch.where(
+                edge_ok[:, None],
+                torch.full((rows, 1), width - 1, device=dev, dtype=torch.int64),
+                torch.full((rows, 1), -1, device=dev, dtype=torch.int64),
+            ),
+        ],
+        dim=1,
+    )
+    compact_width = compact_cols.shape[1]
+
+    slot_live = compact_cols >= 0
+    compact_vals = torch.where(
+        slot_live,
+        torch.gather(base, 1, compact_cols.clamp(min=0)),
+        torch.full(
+            (rows, compact_width), float("-inf"), device=dev, dtype=torch.float32
+        ),
+    ).contiguous()
+    compact_len = slot_live.sum(dim=1).to(torch.int32).contiguous()
+
+    arm_b_raw = torch.full((rows, topk_tokens), -1, device=dev, dtype=torch.int32)
+    torch.ops._C.persistent_topk(
+        compact_vals, compact_len, arm_b_raw, workspace, topk_tokens, compact_width
+    )
+    slot_idx = arm_b_raw.to(torch.int64)
+    arm_b_cols = torch.where(
+        (slot_idx >= 0) & (slot_idx < compact_len.to(torch.int64)[:, None]),
+        torch.gather(compact_cols, 1, slot_idx.clamp(min=0)),
+        torch.full((rows, topk_tokens), -1, device=dev, dtype=torch.int64),
+    )
+
+    # --- equivalence -------------------------------------------------------
+    score_multiset_mismatch: list[str] = []
+    index_set_mismatch: list[str] = []
+    tie_order_rows: list[str] = []
+
+    for r in range(rows):
+        lo, limit = int(starts[r]), int(ends[r])
+        a = {c for c in (int(v) for v in arm_a_out[r].tolist()) if lo <= c < limit}
+        b = {c for c in (int(v) for v in arm_b_cols[r].tolist()) if lo <= c < limit}
+        a_scores = sorted((float(base[r, c]) for c in a), reverse=True)
+        b_scores = sorted((float(base[r, c]) for c in b), reverse=True)
+        if a_scores != b_scores:
+            score_multiset_mismatch.append(
+                f"row {r}: the two arms selected different score multisets "
+                f"(A top3 {a_scores[:3]} != B top3 {b_scores[:3]})"
+            )
+        ordered = base[r, lo:limit].sort(descending=True).values
+        boundary_tied = (
+            ordered.numel() > topk_tokens
+            and float(ordered[topk_tokens - 1]) == float(ordered[topk_tokens])
+        )
+        if a != b:
+            if boundary_tied:
+                tie_order_rows.append(
+                    f"row {r}: both arms kept the same scores but not the same "
+                    f"indices (A\\B={sorted(a - b)}, B\\A={sorted(b - a)})"
+                )
+            else:
+                index_set_mismatch.append(
+                    f"row {r}: arm A {sorted(a)} != arm B {sorted(b)} despite "
+                    "distinct boundary scores"
+                )
+
+    check(
+        not score_multiset_mismatch,
+        "equivalence violated -- the two arms disagree on which scores are "
+        "selected:\n  " + "\n  ".join(score_multiset_mismatch),
+    )
+    check(
+        not index_set_mismatch,
+        "equivalence violated -- different top-k index sets with unambiguous "
+        "boundary scores:\n  " + "\n  ".join(index_set_mismatch),
+    )
+
+    # (ii) Both arms must read the same producer output over the candidate
+    # columns: any nonzero difference is a bug, not a tolerance.
+    a_gathered = torch.gather(arm_a_logits, 1, compact_cols.clamp(min=0))
+    max_abs_diff = float((a_gathered - compact_vals).abs()[slot_live].max())
+    check(
+        max_abs_diff == 0.0,
+        "max |arm_a_logit - arm_b_logit| over candidate columns is "
+        f"{max_abs_diff}, not 0.0",
+    )
+    masked_live = (a_gathered == float("-inf"))[slot_live]
+    check(
+        not bool(masked_live.any()),
+        f"{int(masked_live.sum())} candidate columns were masked out in arm A",
+    )
+
+    # (iii) Non-vacuity: the mask must change the answer somewhere, or the
+    # comparison above holds for a mask that does nothing.
+    unmasked_out = torch.full((rows, topk_tokens), -1, device=dev, dtype=torch.int32)
+    torch.ops._C.persistent_topk(
+        base, ends, unmasked_out, workspace, topk_tokens, width
+    )
+    changed_rows = [
+        r
+        for r in range(rows)
+        if {
+            c
+            for c in (int(v) for v in unmasked_out[r].tolist())
+            if int(starts[r]) <= c < int(ends[r])
+        }
+        != {
+            c
+            for c in (int(v) for v in arm_a_out[r].tolist())
+            if int(starts[r]) <= c < int(ends[r])
+        }
+    ]
+    check(
+        bool(changed_rows),
+        "fixture is vacuous: the candidate mask changed no row's top-k",
+    )
+
+    # --- the k-th-boundary tie, recorded rather than asserted ----------------
+    lower, higher = topk_tokens - 1, topk_tokens
+    tie = torch.full((1, width), -1000.0, device=dev, dtype=torch.float32)
+    tie[0, :lower] = (
+        torch.arange(lower, 0, -1, device=dev, dtype=torch.float32) + 1000.0
+    )
+    tie[0, lower] = 500.0
+    tie[0, higher] = 500.0
+    tie_out = torch.full((1, topk_tokens), -1, device=dev, dtype=torch.int32)
+    torch.ops._C.persistent_topk(
+        tie,
+        torch.tensor([width], device=dev, dtype=torch.int32),
+        tie_out,
+        workspace,
+        topk_tokens,
+        width,
+    )
+    picked = {int(v) for v in tie_out[0].tolist()}
+    check(-1 not in picked, "tie probe selected a pad slot: fixture too narrow")
+    check(
+        len(picked) == topk_tokens,
+        f"tie probe selected {len(picked)} distinct columns, expected {topk_tokens}",
+    )
+    check(
+        set(range(lower)) <= picked,
+        f"tie probe did not select the {lower} strictly-larger columns",
+    )
+    check(
+        (lower in picked) ^ (higher in picked),
+        "tie probe: expected exactly one of the two tied columns, got "
+        f"lower={lower in picked} higher={higher in picked}",
+    )
+    unselected = torch.ones(width, dtype=torch.bool, device=dev)
+    unselected[sorted(picked)] = False
+    check(
+        min(float(tie[0, c]) for c in picked) >= float(tie[0][unselected].max()),
+        "tie probe: the kernel selected a column scoring below an unselected one",
+    )
+    tie_choice = "lower" if lower in picked else "higher"
+    print(
+        "TIE-ORDER FINDING: k-th-boundary tie at packed columns "
+        f"{lower}/{higher} (both exactly 500.0, k={topk_tokens}) -- the "
+        f"persistent_topk kernel emitted the {tie_choice} index. The CPU model "
+        "in this file (_top_k) breaks ties to the lower index; the producer "
+        "keeps torch's unspecified topk order (candidate_blocks.py:178), so a "
+        "particular order is not a contract. Recorded, not asserted.",
+        flush=True,
+    )
+    print(
+        f"DEVICE ARM: rows={rows} width={width} topk_blocks={topk_blocks} "
+        f"block_size={block_size} k={topk_tokens} nblocks={nblocks}; "
+        f"boundary-tie rows in the A/B fixture: {len(tie_order_rows)}; "
+        f"rows whose top-k the mask changed: {len(changed_rows)}; "
+        f"max|A-B| over candidate columns: {max_abs_diff}",
+        flush=True,
     )
 
 
